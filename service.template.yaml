@@ -6,9 +6,10 @@ metadata:
   labels:
     cloud.googleapis.com/location: ${REGION}
   annotations:
-    # Use manual scaling mode with exactly 1 instance to avoid multi-instance split-brain sync issues
-    run.googleapis.com/scalingMode: manual
-    run.googleapis.com/manualInstanceCount: "1"
+    # Set launch stage to BETA, as using an ephemeral disk is in beta
+    run.googleapis.com/launch-stage: BETA
+    # Limit maximum instances to 1 to avoid multi-instance split-brain sync issues
+    run.googleapis.com/maxScale: "1"
     # Disable IAM invoker check to allow unauthenticated (public) access to the service
     run.googleapis.com/invoker-iam-disabled: "true"
 spec:
@@ -24,12 +25,11 @@ spec:
         # before starting the 'main-app' container.
         run.googleapis.com/container-dependencies: '{"main-app": ["gcs-sidecar"]}'
     spec:
-      # Use an in-memory shared volume (backed by tmpfs)
       volumes:
         - name: shared-data
           emptyDir:
-            medium: Memory
-            sizeLimit: 512Mi # Adjust based on data size needs
+            medium: Disk
+            sizeLimit: 10Gi
 
       containers:
         # 1. Main Application Container (Ingress)

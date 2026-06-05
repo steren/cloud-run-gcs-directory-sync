@@ -1,8 +1,8 @@
 # Google Cloud Run GCS Directory Sync Sidecar
 
-A lightweight, robust, and highly optimized Google Cloud Run sidecar container written in Go that synchronizes an in-memory shared volume (`emptyDir`) with Google Cloud Storage (GCS).
+A lightweight, robust, and highly optimized Google Cloud Run sidecar container written in Go that synchronizes an ephemeral disk shared volume (`emptyDir`) with Google Cloud Storage (GCS).
 
-This sidecar implements a **bidirectional-on-lifecycle** synchronization pattern designed for stateless containers that need access to persistent, shared file systems (e.g., file assets, static sites, or simple file databases) with high-speed in-memory reads/writes:
+This sidecar implements a **bidirectional-on-lifecycle** synchronization pattern designed for stateless containers that need access to persistent, shared file systems (e.g., file assets, static sites, or simple file databases) with high-speed local ephemeral disk reads/writes:
 1. **On Startup**: It downloads all files from a specified GCS bucket/prefix into the shared directory. It blocks the main application's startup until the initial download is 100% complete.
 2. **Periodically (Configurable)**: It scans the local shared directory and uploads new or modified files to GCS. It uses file size and MD5 hash comparisons to perform high-performance **delta uploads**, avoiding redundant uploads and minimizing GCS egress costs and API write fees.
 3. **On Shutdown (SIGTERM)**: It traps termination signals sent by Cloud Run, pauses active ticker runs, and executes a final, comprehensive upload sync before gracefully exiting.
@@ -20,8 +20,8 @@ This sidecar implements a **bidirectional-on-lifecycle** synchronization pattern
                       |        | (Reads/Writes)               |
                       |        v                              |
                       |   +===============================+   |
-                      |   |  Shared In-Memory Volume      |   |
-                      |   |  (/data, backed by tmpfs)     |   |
+                      |   |  Shared Ephemeral Disk Vol    |   |
+                      |   |  (/data, SSD-backed emptyDir) |   |
                       |   +===============================+   |
                       |        ^                              |
                       |        | (Syncs Dir)                  |
@@ -106,9 +106,9 @@ gcloud builds submit --tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/
        service.template.yaml > service.yaml
    ```
 
-2. Apply and deploy the generated configuration using `gcloud`:
+2. Apply and deploy the generated configuration using `gcloud beta`:
    ```bash
-    gcloud run services replace service.yaml
+    gcloud beta run services replace service.yaml
     ```
 
 ---
