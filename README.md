@@ -54,18 +54,6 @@ The sidecar is configured entirely via environment variables. Configure these un
 
 ---
 
-## Container Startup Ordering
-
-Cloud Run multi-container services support specifying startup dependencies using the `run.googleapis.com/container-dependencies` annotation. 
-
-The sidecar exposes two endpoints on its `READY_PORT`:
-* `/healthz`: Always returns `200 OK` (liveness probe).
-* `/ready`: Returns `503 Service Unavailable` on startup. Once the initial download from GCS completes successfully, it transitions to returning `200 OK` (readiness probe).
-
-By defining a `startupProbe` pointing to `/ready` on the sidecar and specifying that `main-app` depends on `gcs-sidecar` (see `service.yaml`), Cloud Run guarantees that **the sidecar will download all files from GCS before the main application starts running**.
-
----
-
 ## Quick Start & Deployment Guide
 
 ### 1. Set Environment Variables
@@ -87,9 +75,9 @@ Compile, package, and push the sidecar image using Google Cloud Build (which use
 gcloud builds submit --tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/gcs-sidecar:latest .
 ```
 
-### 3. Build and Push the Main Application Image
+### 3. Build and Push the Main Application Image (Example)
 
-Package and push the example Node.js main application container image using Google Cloud Build:
+This step builds and pushes the provided Node.js web dashboard as the `main-app`. In a real deployment, you should replace the `example/` directory with your own application directory. Your custom application is expected to read from and write data to the `/data` directory (which is mapped to the shared ephemeral volume).
 
 ```bash
 gcloud builds submit --tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/main-app:latest example/
@@ -113,29 +101,6 @@ gcloud builds submit --tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/
 
 ---
 
-## Example Main App (Node.js)
-
-An example main application is provided in the [example/](file:///Users/steren/Documents/persisted-volume/example/) directory. This application is built using Node.js and Express and provides a gorgeous, glassmorphic web dashboard allowing you to inspect, create, edit, and delete files directly inside the `/data` shared volume.
-
-Saving files in the UI instantly triggers the sidecar periodic sync to GCS, and deleting files automatically deletes them from GCS too!
-
-### 1. Run Locally
-To test the example app locally:
-```bash
-cd example
-npm install
-SHARED_DIR=./data PORT=3000 npm start
-```
-Open [http://localhost:3000](http://localhost:3000) to view the file dashboard.
-
-### 2. Build and Deploy
-Build and push the main application image to Artifact Registry:
-```bash
-gcloud builds submit --tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/main-app:latest example/
-```
-
----
-
 ## IAM Permissions & Security
 
 For the sidecar to operate, the service account assigned to the Cloud Run service must have permissions to read, write, and delete objects in your target GCS bucket.
@@ -150,3 +115,15 @@ For the sidecar to operate, the service account assigned to the Cloud Run servic
 - **Highly Efficient Diffing**: Instead of calling GCS metadata endpoints for *every* local file recursively (which causes excessive HTTP overhead and is slow), the sidecar listings are loaded into a memory cache map once at the beginning of each sync cycle. Local file sizes and MD5 hashes are compared against the cache map to only write modified files.
 - **Atomic File Writing**: File writes to the local file system on download are done cleanly. Directories are resolved dynamically.
 - **Safe Signal Handling**: Once SIGTERM is received, the sidecar suspends its periodic execution ticker, shuts down incoming probe servers, and executes a final upload sync. Cloud Run holds the container alive during this period up to the configured container timeout, ensuring complete data replication on instance termination.
+
+---
+
+## Container Startup Ordering
+
+Cloud Run multi-container services support specifying startup dependencies using the `run.googleapis.com/container-dependencies` annotation. 
+
+The sidecar exposes two endpoints on its `READY_PORT`:
+* `/healthz`: Always returns `200 OK` (liveness probe).
+* `/ready`: Returns `503 Service Unavailable` on startup. Once the initial download from GCS completes successfully, it transitions to returning `200 OK` (readiness probe).
+
+By defining a `startupProbe` pointing to `/ready` on the sidecar and specifying that `main-app` depends on `gcs-sidecar` (see `service.yaml`), Cloud Run guarantees that **the sidecar will download all files from GCS before the main application starts running**.
