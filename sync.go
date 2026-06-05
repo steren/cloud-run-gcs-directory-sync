@@ -220,9 +220,22 @@ func UploadDirectory(ctx context.Context, client *storage.Client, bucketName, gc
 	// Step 2: Walk the local directory recursively to identify modified files
 	err := filepath.WalkDir(localDir, func(localPath string, d os.DirEntry, err error) error {
 		if err != nil {
+			// Skip lost+found or any permission-restricted/system directories gracefully
+			if d != nil && d.IsDir() {
+				log.Printf("Warning: skipping unreadable directory during walk: %s: %v", localPath, err)
+				return filepath.SkipDir
+			}
+			if strings.HasSuffix(localPath, "lost+found") || os.IsPermission(err) {
+				log.Printf("Warning: skipping restricted path during walk: %s: %v", localPath, err)
+				return filepath.SkipDir
+			}
 			return err
 		}
 		if d.IsDir() {
+			// Skip lost+found explicitly even if no error was reported yet
+			if d.Name() == "lost+found" {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 

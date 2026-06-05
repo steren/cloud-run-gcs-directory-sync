@@ -246,9 +246,22 @@ func main() {
 func watchDirRecursive(watcher *fsnotify.Watcher, root string) error {
 	return filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
+			// Skip lost+found or any permission-restricted/system directories gracefully
+			if d != nil && d.IsDir() {
+				log.Printf("Warning: skipping unreadable directory during watch registration: %s: %v", path, err)
+				return filepath.SkipDir
+			}
+			if strings.HasSuffix(path, "lost+found") || os.IsPermission(err) {
+				log.Printf("Warning: skipping restricted path during watch registration: %s: %v", path, err)
+				return filepath.SkipDir
+			}
 			return err
 		}
 		if d.IsDir() {
+			// Skip lost+found explicitly even if no error was reported yet
+			if d.Name() == "lost+found" {
+				return filepath.SkipDir
+			}
 			log.Printf("Watching shared subdirectory: %s", path)
 			if err := watcher.Add(path); err != nil {
 				return fmt.Errorf("failed to watch %s: %w", path, err)
