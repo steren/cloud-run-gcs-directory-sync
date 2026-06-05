@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"crypto/md5"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -24,10 +25,33 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"cloud.google.com/go/storage"
 	"google.golang.org/api/iterator"
 )
+
+// LocalFileState caches local file properties to avoid redundant MD5 calculations.
+type LocalFileState struct {
+	Size  int64
+	Mtime time.Time
+	MD5   []byte
+}
+
+var (
+	localStateMutex sync.RWMutex
+	localStateCache = make(map[string]LocalFileState)
+)
+
+// DownloadJob represents a file queued for download.
+type DownloadJob struct {
+	GCSKey    string
+	LocalPath string
+	Size      int64
+	Updated   time.Time
+	MD5       []byte
+}
 
 // DownloadDirectory downloads all files from GCS bucket under gcsPrefix to localDir.
 func DownloadDirectory(ctx context.Context, client *storage.Client, bucketName, gcsPrefix, localDir string) error {
@@ -44,7 +68,7 @@ func DownloadDirectory(ctx context.Context, client *storage.Client, bucketName, 
 	query := &storage.Query{Prefix: prefix}
 	it := bucket.Objects(ctx, query)
 
-	downloadedCount := 0
+	var jobsToDownload []DownloadJob
 	skippedCount := 0
 
 	for {
@@ -70,34 +94,99 @@ func DownloadDirectory(ctx context.Context, client *storage.Client, bucketName, 
 
 		localPath := filepath.Join(localDir, filepath.FromSlash(relPath))
 
-		// Ensure directories for the local file exist
-		if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
-			return fmt.Errorf("failed to create directory for local file %s: %w", localPath, err)
-		}
-
-		// Check if local file exists and matches size and MD5 hash to avoid redundant download
+		// Check if local file exists and matches size and modification time to avoid redundant download
+		skip := false
 		if fileInfo, err := os.Stat(localPath); err == nil {
 			if fileInfo.Size() == attrs.Size {
-				localMD5, err := calculateMD5(localPath)
-				if err == nil && matchesMD5(localMD5, attrs.MD5) {
-					log.Printf("Skipping download of %s (already up to date)", attrs.Name)
-					skippedCount++
-					continue
+				// If local modification time matches remote updated time, we can skip download and hash check!
+				if fileInfo.ModTime().Equal(attrs.Updated) {
+					skip = true
+				} else {
+					// Otherwise fall back to MD5 comparison
+					localMD5, err := calculateMD5(localPath)
+					if err == nil && matchesMD5(localMD5, attrs.MD5) {
+						skip = true
+						// Repair mtime to match GCS so we skip MD5 check next time
+						_ = os.Chtimes(localPath, attrs.Updated, attrs.Updated)
+					}
 				}
 			}
 		}
 
-		// Download GCS object
-		if err := downloadFile(ctx, bucket, attrs.Name, localPath); err != nil {
-			return fmt.Errorf("failed to download %s: %w", attrs.Name, err)
+		if skip {
+			// Populate cache immediately so future uploads skip MD5 recalculation
+			localStateMutex.Lock()
+			localStateCache[localPath] = LocalFileState{
+				Size:  attrs.Size,
+				Mtime: attrs.Updated,
+				MD5:   attrs.MD5,
+			}
+			localStateMutex.Unlock()
+
+			skippedCount++
+			continue
 		}
 
-		log.Printf("Successfully downloaded %s -> %s (%d bytes)", attrs.Name, localPath, attrs.Size)
-		downloadedCount++
+		jobsToDownload = append(jobsToDownload, DownloadJob{
+			GCSKey:    attrs.Name,
+			LocalPath: localPath,
+			Size:      attrs.Size,
+			Updated:   attrs.Updated,
+			MD5:       attrs.MD5,
+		})
+	}
+
+	if len(jobsToDownload) == 0 {
+		log.Printf("Initial download complete. No files to download. Skipped: %d files.", skippedCount)
+		return nil
+	}
+
+	log.Printf("Queued %d files for concurrent download (skipped %d matches)...", len(jobsToDownload), skippedCount)
+
+	// Run concurrent download worker pool
+	const numWorkers = 5
+	jobsChan := make(chan DownloadJob, len(jobsToDownload))
+	errsChan := make(chan error, len(jobsToDownload))
+
+	for w := 0; w < numWorkers; w++ {
+		go func() {
+			for job := range jobsChan {
+				errsChan <- downloadFileWithRetry(ctx, bucket, job.GCSKey, job.LocalPath, job.Updated, job.MD5, job.Size)
+			}
+		}()
+	}
+
+	for _, job := range jobsToDownload {
+		jobsChan <- job
+	}
+	close(jobsChan)
+
+	var downloadErrs []error
+	downloadedCount := 0
+	for i := 0; i < len(jobsToDownload); i++ {
+		err := <-errsChan
+		if err != nil {
+			downloadErrs = append(downloadErrs, err)
+		} else {
+			downloadedCount++
+		}
+	}
+
+	if len(downloadErrs) > 0 {
+		return fmt.Errorf("failed to complete initial download: %w", errors.Join(downloadErrs...))
 	}
 
 	log.Printf("Initial download complete. Downloaded: %d files, Skipped: %d files.", downloadedCount, skippedCount)
 	return nil
+}
+
+// UploadJob represents a file queued for upload.
+type UploadJob struct {
+	LocalPath string
+	GCSKey    string
+	Size      int64
+	Mtime     time.Time
+	MD5       []byte
 }
 
 // UploadDirectory uploads new or modified files from localDir to GCS bucket under gcsPrefix, and deletes removed files.
@@ -124,11 +213,11 @@ func UploadDirectory(ctx context.Context, client *storage.Client, bucketName, gc
 		}
 	}
 
-	uploadedCount := 0
+	var jobsToUpload []UploadJob
 	skippedCount := 0
 	encounteredGCSKeys := make(map[string]bool)
 
-	// Step 2: Walk the local directory recursively
+	// Step 2: Walk the local directory recursively to identify modified files
 	err := filepath.WalkDir(localDir, func(localPath string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -150,25 +239,49 @@ func UploadDirectory(ctx context.Context, client *storage.Client, bucketName, gc
 			return fmt.Errorf("failed to get file info for %s: %w", localPath, err)
 		}
 
-		// Check if remote object exists and matches size & MD5 hash
+		size := fileInfo.Size()
+		mtime := fileInfo.ModTime()
+		var md5Bytes []byte
+
+		// Look up in-memory cache to see if size and mtime match
+		localStateMutex.RLock()
+		cached, exists := localStateCache[localPath]
+		localStateMutex.RUnlock()
+
+		if exists && cached.Size == size && cached.Mtime.Equal(mtime) {
+			md5Bytes = cached.MD5
+		} else {
+			// Compute MD5 and update cache
+			calculatedMD5, err := calculateMD5(localPath)
+			if err != nil {
+				return fmt.Errorf("failed to calculate MD5 for %s: %w", localPath, err)
+			}
+			md5Bytes = calculatedMD5
+
+			localStateMutex.Lock()
+			localStateCache[localPath] = LocalFileState{
+				Size:  size,
+				Mtime: mtime,
+				MD5:   md5Bytes,
+			}
+			localStateMutex.Unlock()
+		}
+
+		// Check if remote GCS object exists and matches size & MD5 hash
 		if gcsAttrs, exists := gcsFiles[gcsKey]; exists {
-			if fileInfo.Size() == gcsAttrs.Size {
-				localMD5, err := calculateMD5(localPath)
-				if err == nil && matchesMD5(localMD5, gcsAttrs.MD5) {
-					// Identical file, skip upload
-					skippedCount++
-					return nil
-				}
+			if size == gcsAttrs.Size && matchesMD5(md5Bytes, gcsAttrs.MD5) {
+				skippedCount++
+				return nil
 			}
 		}
 
-		// Upload modified/new file
-		if err := uploadFile(ctx, bucket, localPath, gcsKey); err != nil {
-			return fmt.Errorf("failed to upload %s to %s: %w", localPath, gcsKey, err)
-		}
-
-		log.Printf("Successfully uploaded %s -> gs://%s/%s (%d bytes)", localPath, bucketName, gcsKey, fileInfo.Size())
-		uploadedCount++
+		jobsToUpload = append(jobsToUpload, UploadJob{
+			LocalPath: localPath,
+			GCSKey:    gcsKey,
+			Size:      size,
+			Mtime:     mtime,
+			MD5:       md5Bytes,
+		})
 		return nil
 	})
 
@@ -178,15 +291,69 @@ func UploadDirectory(ctx context.Context, client *storage.Client, bucketName, gc
 
 	// Step 3: Handle deletion of removed files
 	deletedCount := 0
+	var deletionErrs []error
 	for gcsKey := range gcsFiles {
 		if !encounteredGCSKeys[gcsKey] {
 			log.Printf("Deleting removed file from GCS: gs://%s/%s", bucketName, gcsKey)
-			if err := bucket.Object(gcsKey).Delete(ctx); err != nil {
-				log.Printf("Warning: failed to delete gs://%s/%s: %v", bucketName, gcsKey, err)
+			var delErr error
+			delay := 500 * time.Millisecond
+			for attempt := 1; attempt <= 3; attempt++ {
+				delErr = bucket.Object(gcsKey).Delete(ctx)
+				if delErr == nil {
+					break
+				}
+				log.Printf("Warning: delete attempt %d for gs://%s/%s failed: %v", attempt, bucketName, gcsKey, delErr)
+				time.Sleep(delay)
+				delay *= 2
+			}
+			if delErr != nil {
+				deletionErrs = append(deletionErrs, fmt.Errorf("failed to delete gs://%s/%s: %w", bucketName, gcsKey, delErr))
 			} else {
 				deletedCount++
 			}
 		}
+	}
+
+	// Step 4: Run concurrent upload worker pool
+	uploadedCount := 0
+	var uploadErrs []error
+
+	if len(jobsToUpload) > 0 {
+		log.Printf("Queuing %d files for concurrent upload...", len(jobsToUpload))
+		const numWorkers = 5
+		jobsChan := make(chan UploadJob, len(jobsToUpload))
+		errsChan := make(chan error, len(jobsToUpload))
+
+		for w := 0; w < numWorkers; w++ {
+			go func() {
+				for job := range jobsChan {
+					errsChan <- uploadFileWithRetry(ctx, bucket, job.LocalPath, job.GCSKey, job.Size, job.Mtime, job.MD5)
+				}
+			}()
+		}
+
+		for _, job := range jobsToUpload {
+			jobsChan <- job
+		}
+		close(jobsChan)
+
+		for i := 0; i < len(jobsToUpload); i++ {
+			err := <-errsChan
+			if err != nil {
+				uploadErrs = append(uploadErrs, err)
+			} else {
+				uploadedCount++
+			}
+		}
+	}
+
+	// Combine all errors from uploads and deletions
+	var allErrs []error
+	allErrs = append(allErrs, uploadErrs...)
+	allErrs = append(allErrs, deletionErrs...)
+
+	if len(allErrs) > 0 {
+		return fmt.Errorf("upload sync completed with errors: %w", errors.Join(allErrs...))
 	}
 
 	log.Printf("Upload sync complete. Uploaded: %d, Skipped: %d, Deleted from GCS: %d.", uploadedCount, skippedCount, deletedCount)
@@ -262,4 +429,86 @@ func uploadFile(ctx context.Context, bucket *storage.BucketHandle, localPath, gc
 	}
 
 	return writer.Close()
+}
+
+func downloadFileWithRetry(ctx context.Context, bucket *storage.BucketHandle, gcsKey, localPath string, updatedTime time.Time, md5Bytes []byte, size int64) error {
+	var err error
+	delay := 1 * time.Second
+	maxAttempts := 3
+
+	// Ensure parent directory exists before downloading
+	if errDir := os.MkdirAll(filepath.Dir(localPath), 0755); errDir != nil {
+		return fmt.Errorf("failed to create parent directory for %s: %w", localPath, errDir)
+	}
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		err = downloadFile(ctx, bucket, gcsKey, localPath)
+		if err == nil {
+			// Preserving remote modification time locally
+			if errCht := os.Chtimes(localPath, updatedTime, updatedTime); errCht != nil {
+				log.Printf("Warning: failed to set mtime for %s: %v", localPath, errCht)
+			}
+
+			// Populate cache immediately so future uploads skip MD5 calculation
+			localStateMutex.Lock()
+			localStateCache[localPath] = LocalFileState{
+				Size:  size,
+				Mtime: updatedTime,
+				MD5:   md5Bytes,
+			}
+			localStateMutex.Unlock()
+
+			log.Printf("Successfully downloaded gs://%s -> %s (%d bytes)", gcsKey, localPath, size)
+			return nil
+		}
+
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		log.Printf("Download attempt %d for %s failed: %v. Retrying in %v...", attempt, gcsKey, err, delay)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+		delay *= 2
+	}
+	return fmt.Errorf("failed to download %s after %d attempts: %w", gcsKey, maxAttempts, err)
+}
+
+func uploadFileWithRetry(ctx context.Context, bucket *storage.BucketHandle, localPath, gcsKey string, size int64, mtime time.Time, md5Bytes []byte) error {
+	var err error
+	delay := 1 * time.Second
+	maxAttempts := 3
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		err = uploadFile(ctx, bucket, localPath, gcsKey)
+		if err == nil {
+			// Update local cache state with mtime and MD5 on successful upload
+			localStateMutex.Lock()
+			localStateCache[localPath] = LocalFileState{
+				Size:  size,
+				Mtime: mtime,
+				MD5:   md5Bytes,
+			}
+			localStateMutex.Unlock()
+
+			log.Printf("Successfully uploaded %s -> gs://%s (%d bytes)", localPath, gcsKey, size)
+			return nil
+		}
+
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		log.Printf("Upload attempt %d for %s failed: %v. Retrying in %v...", attempt, localPath, err, delay)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+		delay *= 2
+	}
+	return fmt.Errorf("failed to upload %s after %d attempts: %w", localPath, maxAttempts, err)
 }

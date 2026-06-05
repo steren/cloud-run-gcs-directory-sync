@@ -16,15 +16,19 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"cloud.google.com/go/storage"
+	"github.com/fsnotify/fsnotify"
 )
 
 func main() {
@@ -104,39 +108,120 @@ func main() {
 	}
 	defer storageClient.Close()
 
-	// 3. Perform initial startup download from Cloud Storage
+	// 3. Perform initial startup download from Cloud Storage with a standard retry loop
 	log.Println("Executing initial startup download from Cloud Storage...")
-	if err := DownloadDirectory(ctx, storageClient, bucketName, gcsPrefix, sharedDir); err != nil {
-		log.Fatalf("FATAL: Initial startup download failed: %v", err)
+	var initErr error
+	delay := 2 * time.Second
+	maxAttempts := 3
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		initErr = DownloadDirectory(ctx, storageClient, bucketName, gcsPrefix, sharedDir)
+		if initErr == nil {
+			break
+		}
+		if attempt < maxAttempts {
+			log.Printf("Warning: initial download attempt %d failed: %v. Retrying in %v...", attempt, initErr, delay)
+			time.Sleep(delay)
+			delay *= 2
+		}
+	}
+	if initErr != nil {
+		log.Fatalf("FATAL: Initial startup download failed after %d attempts: %v", maxAttempts, initErr)
 	}
 
 	// Signal readiness
 	log.Println("Initial download completed successfully. Signaling readiness.")
 	startupDone.Store(true)
 
-	// 4. Setup ticker and signal handlers
+	// 4. Setup fsnotify watcher for real-time changes
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Fatalf("FATAL: Failed to create fsnotify watcher: %v", err)
+	}
+	defer watcher.Close()
+
+	// Recursively register watches under the shared volume directory
+	if err := watchDirRecursive(watcher, sharedDir); err != nil {
+		log.Printf("Warning: failed to watch shared directory %s recursively: %v", sharedDir, err)
+	}
+
+	// 5. Setup ticker and signal handlers
 	ticker := time.NewTicker(syncInterval)
 	defer ticker.Stop()
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 
+	// Single-threaded coordinator trigger helper
+	triggerUpload := func(reason string) {
+		log.Printf("Sync upload triggered by %s...", reason)
+		syncCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		if err := UploadDirectory(syncCtx, storageClient, bucketName, gcsPrefix, sharedDir); err != nil {
+			log.Printf("Error during upload sync: %v", err)
+		}
+		cancel()
+	}
+
+	var debounceTimer *time.Timer
+	var debounceChan <-chan time.Time
+
 	log.Println("Entering main synchronization loop.")
 	for {
 		select {
-		case <-ticker.C:
-			log.Println("Periodic sync triggered...")
-			syncCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			if err := UploadDirectory(syncCtx, storageClient, bucketName, gcsPrefix, sharedDir); err != nil {
-				log.Printf("Error during periodic upload sync: %v", err)
+		case event, ok := <-watcher.Events:
+			if !ok {
+				break
 			}
-			cancel()
+
+			// Ignore hidden/metadata temporary files (such as those starting with ".")
+			base := filepath.Base(event.Name)
+			if strings.HasPrefix(base, ".") || strings.HasSuffix(base, "~") {
+				continue
+			}
+
+			// Process writes, creations, deletions, and renamings
+			if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) || event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename) {
+				log.Printf("Real-time file system change detected: %v", event)
+
+				// If a new directory is created, register a watch on it recursively
+				if event.Has(fsnotify.Create) {
+					info, err := os.Stat(event.Name)
+					if err == nil && info.IsDir() {
+						_ = watchDirRecursive(watcher, event.Name)
+					}
+				}
+
+				// Reset or initialize debounce timer (debounce uploads by 2 seconds of inactivity)
+				if debounceTimer != nil {
+					debounceTimer.Stop()
+				}
+				debounceTimer = time.NewTimer(2 * time.Second)
+				debounceChan = debounceTimer.C
+			}
+
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				break
+			}
+			log.Printf("fsnotify watcher encountered error: %v", err)
+
+		case <-debounceChan:
+			// Timer fired, execute upload sync
+			debounceChan = nil
+			debounceTimer = nil
+			triggerUpload("real-time change events (debounced)")
+
+		case <-ticker.C:
+			// Regular periodic check fallback
+			triggerUpload("periodic interval ticker")
 
 		case sig := <-sigs:
 			log.Printf("Received termination signal (%v). Commencing graceful shutdown.", sig)
 			ticker.Stop()
+			if debounceTimer != nil {
+				debounceTimer.Stop()
+			}
 
-			// Shutdown HTTP server so no new ready probes or traffic is sent to us (though we are a sidecar)
+			// Shutdown HTTP server
 			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			_ = server.Shutdown(shutdownCtx)
 			shutdownCancel()
@@ -155,4 +240,20 @@ func main() {
 			os.Exit(0)
 		}
 	}
+}
+
+// watchDirRecursive walks root and adds any subdirectories to the watcher recursively.
+func watchDirRecursive(watcher *fsnotify.Watcher, root string) error {
+	return filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			log.Printf("Watching shared subdirectory: %s", path)
+			if err := watcher.Add(path); err != nil {
+				return fmt.Errorf("failed to watch %s: %w", path, err)
+			}
+		}
+		return nil
+	})
 }

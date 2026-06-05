@@ -2,10 +2,11 @@
 
 A lightweight, robust, and highly optimized Google Cloud Run sidecar container written in Go that synchronizes an ephemeral disk shared volume (`emptyDir`) with Google Cloud Storage (GCS).
 
-This sidecar implements a **bidirectional-on-lifecycle** synchronization pattern designed for stateless containers that need access to persistent, shared file systems (e.g., file assets, static sites, or simple file databases) with high-speed local ephemeral disk reads/writes:
+This sidecar implements a highly responsive **bidirectional and event-driven** synchronization pattern designed for stateless containers that need access to persistent, shared file systems (e.g., file assets, static sites, or simple file databases) with high-speed local ephemeral disk reads/writes:
 1. **On Startup**: It downloads all files from a specified GCS bucket/prefix into the shared directory. It blocks the main application's startup until the initial download is 100% complete.
-2. **Periodically (Configurable)**: It scans the local shared directory and uploads new or modified files to GCS. It uses file size and MD5 hash comparisons to perform high-performance **delta uploads**, avoiding redundant uploads and minimizing GCS egress costs and API write fees.
-3. **On Shutdown (SIGTERM)**: It traps termination signals sent by Cloud Run, pauses active ticker runs, and executes a final, comprehensive upload sync before gracefully exiting.
+2. **On File System Changes (Real-time Watcher)**: It uses an event-driven `fsnotify` file system watcher to track file creation, modification, deletion, and renaming events in real time, executing a debounced upload sync within 2 seconds of filesystem inactivity.
+3. **Periodically (Configurable)**: It periodically scans the local shared directory as a robust fallback and uploads new or modified files to GCS. It uses file size and MD5 hash comparisons to perform high-performance **delta uploads**, avoiding redundant uploads and minimizing GCS egress costs and API write fees.
+4. **On Shutdown (SIGTERM)**: It traps termination signals sent by Cloud Run, pauses active ticker runs, and executes a final, comprehensive upload sync before gracefully exiting.
 
 ---
 
@@ -21,7 +22,7 @@ This sidecar implements a **bidirectional-on-lifecycle** synchronization pattern
                       |        v                              |
                       |   +===============================+   |
                       |   |  Shared Ephemeral Disk Vol    |   |
-                      |   |  (/data, SSD-backed emptyDir) |   |
+                      |   |  (/data, ephemeral emptyDir)  |   |
                       |   +===============================+   |
                       |        ^                              |
                       |        | (Syncs Dir)                  |
@@ -112,6 +113,7 @@ For the sidecar to operate, the service account assigned to the Cloud Run servic
 
 ## Key Design Optimizations
 
+- **Real-Time Event-Driven Sync**: Uses `fsnotify` to listen for directory writes, creation, and deletions, and automatically registers watches recursively on subdirectories. File modifications are debounced by 2 seconds of filesystem inactivity to prevent redundant GCS writes during active burst periods, ensuring instant and resource-efficient synchronization.
 - **Highly Efficient Diffing**: Instead of calling GCS metadata endpoints for *every* local file recursively (which causes excessive HTTP overhead and is slow), the sidecar listings are loaded into a memory cache map once at the beginning of each sync cycle. Local file sizes and MD5 hashes are compared against the cache map to only write modified files.
 - **Atomic File Writing**: File writes to the local file system on download are done cleanly. Directories are resolved dynamically.
 - **Safe Signal Handling**: Once SIGTERM is received, the sidecar suspends its periodic execution ticker, shuts down incoming probe servers, and executes a final upload sync. Cloud Run holds the container alive during this period up to the configured container timeout, ensuring complete data replication on instance termination.
